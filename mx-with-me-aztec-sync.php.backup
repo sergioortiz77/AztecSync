@@ -1,0 +1,482 @@
+<?php
+/**
+ * Plugin Name:         MX with ME - Aztec Sync (Motor Ortocronobiológico)
+ * Description:         Backend seguro para la App Aztec Sync. Gestiona el cálculo de la Piedra del Sol y la bitácora privada de usuarios.
+ * Version:             1.1.0
+ * Author:              MX with ME Dev Team
+ * Text Domain:         mx-aztec-sync
+ * Requires at least:   6.0
+ * Requires PHP:        7.4
+ */
+
+// 1. SEGURIDAD: Prevenir acceso directo al archivo
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// 2. SEGURIDAD: Evitar re-declaración si el plugin se carga dos veces
+if (!class_exists('MXWM_Aztec_Sync')) {
+
+    class MXWM_Aztec_Sync
+    {
+
+        // Instancia única (Singleton) para evitar duplicidad en memoria
+        private static $instance = null;
+
+        // Los 20 Glifos (Correlación Antonio Caso)
+        private $glifos = [
+            'Cipactli',
+            'Ehecatl',
+            'Calli',
+            'Cuetzpalin',
+            'Coatl',
+            'Miquiztli',
+            'Mazatl',
+            'Tochtli',
+            'Atl',
+            'Itzcuintli',
+            'Ozomahtli',
+            'Malinalli',
+            'Acatl',
+            'Ocelotl',
+            'Cuauhtli',
+            'Cozcacuauhtli',
+            'Ollin',
+            'Tecpatl',
+            'Quiahuitl',
+            'Xochitl'
+        ];
+
+        public static function get_instance()
+        {
+            if (self::$instance == null) {
+                self::$instance = new MXWM_Aztec_Sync();
+            }
+            return self::$instance;
+        }
+
+        private function __construct()
+        {
+            // Hooks de inicialización estándar
+            add_action('init', [$this, 'register_cpt']);
+            add_action('init', [$this, 'register_shortcode']); // ¡Línea faltante agregada!
+            add_action('rest_api_init', [$this, 'register_api_routes']);
+
+            // Hook de activación para limpiar reglas de enlace (evita error 404)
+            register_activation_hook(__FILE__, [$this, 'plugin_activation']);
+        }
+
+        public function plugin_activation()
+        {
+            $this->register_cpt();
+            flush_rewrite_rules();
+        }
+
+        /**
+         * REGISTRO DEL CPT: Bitácora Azteca
+         * Configurado como PRIVADO para no afectar el SEO ni el diseño del tema BuddyX.
+         */
+        public function register_cpt()
+        {
+            $args = [
+                'labels' => [
+                    'name' => 'Bitácoras Aztec',
+                    'singular_name' => 'Entrada Bitácora'
+                ],
+                'public' => false,  // NO accesible públicamente en web
+                'publicly_queryable' => false,  // Solo accesible vía código/API
+                'show_ui' => true,   // Visible en Admin para debug
+                'show_in_menu' => true,
+                'query_var' => true,
+                'rewrite' => ['slug' => 'bitacora-azteca'],
+                'capability_type' => 'post',
+                'has_archive' => false,
+                'hierarchical' => false,
+                'menu_position' => 6,      // Debajo de Podcasts
+                'menu_icon' => 'dashicons-calendar-alt',
+                'supports' => ['title', 'custom-fields', 'author'],
+                'show_in_rest' => false,  // Ocultamos la ruta REST por defecto, usaremos la nuestra
+            ];
+
+            register_post_type('bitacora_azteca', $args);
+        }
+
+        /**
+         * RUTAS API REST (Namespace: mxwm/v1/aztec-sync)
+         * No colisiona con /videos ni /podcasts
+         */
+        public function register_api_routes()
+        {
+            $ns = 'mxwm/v1';
+
+            // GET: Datos del Día (Público para la App)
+            register_rest_route($ns, '/aztec-sync/hoy', [
+                'methods' => 'GET',
+                'callback' => [$this, 'get_current_glyph_data'],
+                'permission_callback' => '__return_true'
+            ]);
+
+            // POST: Guardar Diario (Requiere Login)
+            register_rest_route($ns, '/aztec-sync/log', [
+                'methods' => 'POST',
+                'callback' => [$this, 'save_log_entry'],
+                'permission_callback' => function () {
+                    return is_user_logged_in();
+                }
+            ]);
+
+            // GET: Historial del Usuario (Requiere Login)
+            register_rest_route($ns, '/aztec-sync/history', [
+                'methods' => 'GET',
+                'callback' => [$this, 'get_user_history'],
+                'permission_callback' => function () {
+                    return is_user_logged_in();
+                }
+            ]);
+            // POST: Proxy Gemini (Interpretar Bitácora con IA)
+            register_rest_route($ns, '/aztec-sync/gemini', [
+                'methods' => 'POST',
+                'callback' => [$this, 'handle_gemini_request'],
+                'permission_callback' => '__return_true' // TEMPORAL: Permitir acceso a invitados para pruebas
+            ]);
+        }
+
+        /**
+         * SHORTCODE: [aztec_sync_app]
+         * Genera el contenedor para montar la App de React.
+         */
+        public function register_shortcode()
+        {
+            add_shortcode('aztec_sync_app', [$this, 'render_app_container']);
+        }
+
+        public function render_app_container($atts)
+        {
+            // URL base donde el usuario subirá la carpeta 'dist' (renombrada a 'app-dist')
+            $app_url = plugin_dir_url(__FILE__) . 'app-dist/index.html';
+
+            // Estilos para presentar la App como un "Móvil en Web"
+            // Centrado, con ancho máximo de 450px y bordes redondeados
+            return '
+            <div id="aztec-app-wrapper" style="display: flex; justify-content: center; align-items: center; width: 100%; background-color: #050505; padding: 20px 0;">
+                <iframe 
+                    src="' . esc_url($app_url) . '" 
+                    title="Aztec Sync App"
+                    style="width: 100%; max-width: 450px; height: 85vh; min-height: 600px; border: 1px solid #333; border-radius: 30px; box-shadow: 0 0 50px rgba(0, 240, 255, 0.15);"
+                    allow="geolocation; microphone; camera; display-capture"
+                ></iframe>
+            </div>';
+        }
+
+        /**
+         * PROXY GEMINI API
+         * Se comunica con Google Gemini usando la Key del servidor (wp-config.php)
+         */
+        private function mxwm_call_gemini_api($prompt)
+        {
+            // Asegurarse de definir GEMINI_API_KEY en wp-config.php
+            if (!defined('GEMINI_API_KEY')) {
+                return new WP_Error('api_key_missing', 'La clave de API de Gemini no está configurada en el servidor.');
+            }
+
+            $api_key = GEMINI_API_KEY;
+            // Usamos el modelo Flash por velocidad y eficiencia
+            $api_url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' . $api_key;
+
+            $body = array(
+                'contents' => array(
+                    array(
+                        'parts' => array(
+                            array('text' => $prompt)
+                        )
+                    )
+                )
+            );
+
+            $response = wp_remote_post($api_url, array(
+                'method' => 'POST',
+                'headers' => array('Content-Type' => 'application/json'),
+                'body' => json_encode($body),
+                'timeout' => 60,
+            ));
+
+            if (is_wp_error($response)) {
+                return $response;
+            }
+
+            $response_body = json_decode(wp_remote_retrieve_body($response), true);
+
+            if (isset($response_body['candidates'][0]['content']['parts'][0]['text'])) {
+                return $response_body['candidates'][0]['content']['parts'][0]['text'];
+            }
+
+            if (isset($response_body['error']['message'])) {
+                return new WP_Error('gemini_api_error', $response_body['error']['message']);
+            }
+
+            return new WP_Error('invalid_gemini_response', 'La respuesta de la API de Gemini no fue válida.');
+        }
+
+        /**
+         * CALLBACK: /aztec-sync/gemini
+         * Recibe input de la App y lo manda a Gemini
+         */
+        public function handle_gemini_request($request)
+        {
+            $params = $request->get_json_params();
+            $user_prompt = sanitize_text_field($params['prompt'] ?? '');
+
+            if (empty($user_prompt)) {
+                return new WP_Error('empty_prompt', 'El prompt no puede estar vacío.', ['status' => 400]);
+            }
+
+            // Llamada segura server-to-server
+            $ai_response = $this->mxwm_call_gemini_api($user_prompt);
+
+            if (is_wp_error($ai_response)) {
+                return $ai_response;
+            }
+
+            return new WP_REST_Response([
+                'status' => 'success',
+                'ai_response' => $ai_response
+            ], 200);
+        }
+
+        /**
+         * LÓGICA DE CÁLCULO (Motor Ortocronobiológico)
+         */
+        private function calcular_glifo($timestamp)
+        {
+            // Referencia astronómica (Ajustar según necesidad exacta)
+            // Usamos un ancla conocida para el cálculo modular
+            $known_date = strtotime('2025-12-28'); // Día Águila (Cuauhtli - índice 14) según tu prompt
+            $known_index = 14;
+
+            // Cálculos de días transcurridos
+            $seconds_diff = $timestamp - $known_date;
+            $days_diff = floor($seconds_diff / (60 * 60 * 24));
+
+            // Aritmética modular para ciclo de 20
+            $index = ($known_index + $days_diff) % 20;
+
+            // Corrección para fechas pasadas (PHP devuelve módulo negativo)
+            if ($index < 0) {
+                $index = 20 + $index;
+            }
+
+            return [
+                'index' => $index,
+                'nombre' => $this->glifos[$index],
+                'nombre_nahuatl' => $this->glifos[$index] // Aquí podrías mapear traducciones si difieren
+            ];
+        }
+
+        // --- CALLBACKS DE LA API ---
+
+        public function get_current_glyph_data($request)
+        {
+            // Permitir simulación de fecha vía parámetro ?timestamp=123456
+            $timestamp = $request->get_param('timestamp') ? intval($request->get_param('timestamp')) : time();
+
+            $glifo = $this->calcular_glifo($timestamp);
+
+            return new WP_REST_Response([
+                'status' => 'success',
+                'fecha_servidor' => date('Y-m-d H:i:s', $timestamp),
+                'glifo' => $glifo,
+                'meta' => [
+                    'ciclo' => 'Circa Vigesimal',
+                    'nota' => 'El cambio de glifo depende del Sunset local del usuario.'
+                ]
+            ], 200);
+        }
+
+        public function save_log_entry($request)
+        {
+            $user_id = get_current_user_id();
+            $params = $request->get_json_params();
+
+            // Validación básica
+            if (empty($params['titulo_dia'])) {
+                return new WP_Error('missing_data', 'El título del día es obligatorio.', ['status' => 400]);
+            }
+
+            // Preparar metadatos seguros
+            $meta_input = [
+                'fecha_real' => sanitize_text_field($params['fecha']),
+                'glifo_registrado' => sanitize_text_field($params['glifo_nombre']),
+                'emocion_predominante' => sanitize_text_field($params['emocion']),
+
+                // Preguntas Profundas (Text Areas)
+                'q_programacion' => sanitize_textarea_field($params['q_programacion'] ?? ''),
+                'q_creacion' => sanitize_textarea_field($params['q_creacion'] ?? ''),
+                'q_sexualidad' => sanitize_textarea_field($params['q_sexualidad'] ?? ''),
+                'q_relaciones' => sanitize_textarea_field($params['q_relaciones'] ?? ''),
+
+                // Booleans (Guardados como 1/0 para eficiencia en DB)
+                'check_energia' => !empty($params['check_energia']) ? 1 : 0,
+                'check_claridad' => !empty($params['check_claridad']) ? 1 : 0,
+                'check_error' => !empty($params['check_error']) ? 1 : 0,
+                'check_proposito' => !empty($params['check_proposito']) ? 1 : 0,
+            ];
+
+            // Insertar Post
+            $post_id = wp_insert_post([
+                'post_title' => sanitize_text_field($params['titulo_dia']),
+                'post_content' => '', // Contenido vacío, todo va en meta para estructura
+                'post_type' => 'bitacora_azteca',
+                'post_status' => 'private', // Privado por seguridad
+                'post_author' => $user_id,
+                'meta_input' => $meta_input
+            ]);
+
+            if (is_wp_error($post_id)) {
+                return new WP_Error('db_error', 'No se pudo guardar la bitácora.', ['status' => 500]);
+            }
+
+            return new WP_REST_Response(['id' => $post_id, 'message' => 'Sincronización guardada.'], 201);
+        }
+
+        public function get_user_history($request)
+        {
+            $user_id = get_current_user_id();
+
+            // Obtener últimas 40 entradas (2 veintenas)
+            $args = [
+                'post_type' => 'bitacora_azteca',
+                'author' => $user_id,
+                'posts_per_page' => 40,
+                'post_status' => 'private',
+                'orderby' => 'date',
+                'order' => 'DESC'
+            ];
+
+            $posts = get_posts($args);
+            $history = [];
+
+            foreach ($posts as $p) {
+                $history[] = [
+                    'id' => $p->ID,
+                    'fecha' => get_post_meta($p->ID, 'fecha_real', true),
+                    'titulo' => $p->post_title,
+                    'glifo' => get_post_meta($p->ID, 'glifo_registrado', true),
+                    'emocion' => get_post_meta($p->ID, 'emocion_predominante', true),
+                    // Devolvemos solo lo necesario para el mapa visual
+                ];
+            }
+
+            return new WP_REST_Response($history, 200);
+        }
+    }
+
+    // Inicializar el Plugin
+    MXWM_Aztec_Sync::get_instance();
+}
+
+        // ====================================================================
+        // LÓGICA DE GUARDADO Y TOKENS (VERSIÓN "CUATRO ACUERDOS")
+        // ====================================================================
+
+        public function save_log_entry($request) {
+            $user_id = get_current_user_id();
+            $params = $request->get_json_params();
+
+            // 1. Validación: El título es obligatorio
+            if (empty($params['titulo_dia'])) {
+                return new WP_Error('missing_data', 'El título del día es obligatorio.', ['status' => 400]);
+            }
+
+            // 2. Valores de Tokens
+            $VALOR_TITULO = 5;      
+            $VALOR_BINARIO = 2;     
+            $VALOR_TEXTO = 15;      
+            
+            $tokens_ganados = 0;
+
+            // 3. Sanitización y Cálculo de Tokens
+
+            // --- A. Título del día ---
+            $titulo = sanitize_text_field($params['titulo_dia']);
+            if (!empty($titulo)) {
+                $tokens_ganados += $VALOR_TITULO;
+            }
+
+            // --- B. Preguntas Binarias (Los 4 Acuerdos) ---
+            // 1. ¿Tomaste las cosas de manera personal?
+            // 2. ¿Fuiste pulcro con tus palabras?
+            // 3. ¿Hiciste suposiciones vagas?
+            // 4. ¿Hiciste tu mejor esfuerzo?
+            
+            // Convertimos a 1 o 0 para guardar en DB.
+            // Nota: Se otorgan tokens por la ACCIÓN de responder (participación), 
+            // independientemente de si la respuesta es Sí o No.
+            $check_personal = isset($params['check_personal']) ? ($params['check_personal'] ? 1 : 0) : null;
+            $check_palabras = isset($params['check_palabras']) ? ($params['check_palabras'] ? 1 : 0) : null;
+            $check_suposiciones = isset($params['check_suposiciones']) ? ($params['check_suposiciones'] ? 1 : 0) : null;
+            $check_esfuerzo = isset($params['check_esfuerzo']) ? ($params['check_esfuerzo'] ? 1 : 0) : null;
+
+            if (!is_null($check_personal)) $tokens_ganados += $VALOR_BINARIO;
+            if (!is_null($check_palabras)) $tokens_ganados += $VALOR_BINARIO;
+            if (!is_null($check_suposiciones)) $tokens_ganados += $VALOR_BINARIO;
+            if (!is_null($check_esfuerzo)) $tokens_ganados += $VALOR_BINARIO;
+
+            // --- C. Preguntas Abiertas (Solo 2 preguntas) ---
+            // 1. Programación (Niñez)
+            // 2. Creaciones (Relevancia)
+            
+            $q_programacion = sanitize_textarea_field($params['q_programacion'] ?? '');
+            $q_creacion = sanitize_textarea_field($params['q_creacion'] ?? '');
+
+            // Sumar tokens si hay contenido sustancial (> 5 caracteres)
+            if (strlen($q_programacion) > 5) $tokens_ganados += $VALOR_TEXTO;
+            if (strlen($q_creacion) > 5) $tokens_ganados += $VALOR_TEXTO;
+
+            // 4. Preparar Metadatos (Schema actualizado)
+            $meta_input = [
+                'fecha_real' => sanitize_text_field($params['fecha']), 
+                'glifo_registrado' => sanitize_text_field($params['glifo_nombre']),
+                'emocion_predominante' => sanitize_text_field($params['emocion']), 
+                
+                // Inputs profundos
+                'q_programacion' => $q_programacion,
+                'q_creacion' => $q_creacion,
+
+                // Inputs binarios (Nuevas keys descriptivas)
+                'check_personal' => $check_personal,
+                'check_palabras' => $check_palabras,
+                'check_suposiciones' => $check_suposiciones,
+                'check_esfuerzo' => $check_esfuerzo,
+                
+                // Registro de recompensa
+                'tokens_earned_this_entry' => $tokens_ganados
+            ];
+
+            // 5. Insertar Post
+            $post_id = wp_insert_post([
+                'post_title' => $titulo,
+                'post_content' => '', 
+                'post_type' => 'bitacora_azteca',
+                'post_status' => 'private', 
+                'post_author' => $user_id,
+                'meta_input' => $meta_input
+            ]);
+
+            if (is_wp_error($post_id)) {
+                return new WP_Error('db_error', 'No se pudo guardar la bitácora.', ['status' => 500]);
+            }
+
+            // 6. Actualizar Billetera
+            $current_balance = (int) get_user_meta($user_id, 'mxwm_wallet_balance', true);
+            $new_balance = $current_balance + $tokens_ganados;
+            update_user_meta($user_id, 'mxwm_wallet_balance', $new_balance);
+
+            // 7. Respuesta
+            return new WP_REST_Response([
+                'status' => 'success',
+                'id' => $post_id,
+                'tokens_ganados' => $tokens_ganados,
+                'nuevo_saldo' => $new_balance,
+                'message' => 'Bitácora guardada en la Matriz.'
+            ], 201);
+        }
